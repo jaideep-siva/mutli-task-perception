@@ -1,0 +1,22 @@
+model:
+  name: multitask_perception
+  in_channels: 3
+  backbone: resnet18
+  pretrained: false
+
+  neck:
+    name: fpn
+    out_channels: 256
+
+tasks:
+  detection:
+    enabled: true
+    num_classes: 8
+    num_anchors: 3
+
+  segmentation:
+    enabled: false
+    num_classes: 2
+
+input:
+  image_size: [640, 1280]
