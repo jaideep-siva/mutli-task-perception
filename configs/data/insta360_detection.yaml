@@ -1,0 +1,14 @@
+root_dir: data/insta360_detection
+image_size: [640, 1280]
+batch_size: 2
+num_workers: 0
+val_fraction: 0.2
+keep_empty: false
+class_map:
+  background: 0
+  barrel: 1
+  cone_large: 2
+  cone_small: 3
+  pedestrian: 4
+  soup_sign: 5
+  stop_sign: 6
