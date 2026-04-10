@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,7 +32,8 @@ class SampleRecord:
     """Index entry for a valid dataset sample."""
 
     json_path: Path
-    image_path: Path
+    image_path: Path | None
+    has_embedded_image: bool
     boxes: list[list[float]]
     labels: list[int]
 
@@ -84,7 +87,8 @@ class LabelMeDetectionDataset(Dataset[dict[str, Any]]):
         """
 
         sample = self.samples[index]
-        with Image.open(sample.image_path) as image:
+        image = self._load_sample_image(sample)
+        with image:
             image = image.convert("RGB")
             orig_width, orig_height = image.size
             resized = image.resize(
@@ -133,7 +137,12 @@ class LabelMeDetectionDataset(Dataset[dict[str, Any]]):
                 continue
 
             image_path = self._resolve_image_path(json_path, annotation)
-            if image_path is None or not image_path.exists():
+            has_embedded_image = isinstance(annotation.get("imageData"), str) and bool(
+                annotation.get("imageData")
+            )
+            if image_path is None and not has_embedded_image:
+                continue
+            if image_path is not None and not image_path.exists() and not has_embedded_image:
                 continue
 
             boxes, labels = self._parse_rectangles(annotation)
@@ -142,6 +151,7 @@ class LabelMeDetectionDataset(Dataset[dict[str, Any]]):
                     SampleRecord(
                         json_path=json_path,
                         image_path=image_path,
+                        has_embedded_image=has_embedded_image,
                         boxes=boxes,
                         labels=labels,
                     )
@@ -166,6 +176,24 @@ class LabelMeDetectionDataset(Dataset[dict[str, Any]]):
             if candidate.exists():
                 return candidate
         return None
+
+    def _load_sample_image(self, sample: SampleRecord) -> Image.Image:
+        """Loads the sample image from disk or from embedded LabelMe image data."""
+
+        if sample.image_path is not None and sample.image_path.exists():
+            return Image.open(sample.image_path)
+
+        with sample.json_path.open("r", encoding="utf-8") as handle:
+            annotation = json.load(handle)
+
+        image_data = annotation.get("imageData")
+        if not isinstance(image_data, str) or not image_data:
+            raise FileNotFoundError(
+                f"Missing image file and embedded imageData for '{sample.json_path}'."
+            )
+
+        decoded = base64.b64decode(image_data)
+        return Image.open(io.BytesIO(decoded))
 
     def _parse_rectangles(
         self, annotation: dict[str, Any]

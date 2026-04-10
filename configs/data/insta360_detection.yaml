@@ -1,4 +1,4 @@
-root_dir: data/insta360_detection
+root_dir: data
 image_size: [640, 1280]
 batch_size: 2
 num_workers: 0
