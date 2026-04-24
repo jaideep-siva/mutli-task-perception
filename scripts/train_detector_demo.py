@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
 import sys
 from pathlib import Path
@@ -44,6 +45,11 @@ from src.utils.config import load_yaml
 from src.utils.detection_metrics import compute_detection_metrics_epoch
 from src.utils.plot_training_curves import plot_metrics_summary
 from src.utils.visualization import draw_gt_boxes, draw_pred_boxes
+
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -311,11 +317,103 @@ def loss_dict_to_loggable(loss_dict: dict[str, torch.Tensor]) -> dict[str, float
     return output
 
 
+def flatten_wandb_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Converts nested config dictionaries into a flat mapping for W&B."""
+    flattened: dict[str, Any] = {}
+    for key, value in config.items():
+        full_key = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            flattened.update(flatten_wandb_config(value, full_key))
+        else:
+            flattened[full_key] = value
+    return flattened
+
+
+def init_wandb_run(
+    train_config: dict[str, Any],
+    data_config: dict[str, Any],
+) -> Any | None:
+    """Initializes a Weights & Biases run when enabled in config."""
+    wandb_config = train_config.get("wandb", {})
+    if not wandb_config.get("enabled", False):
+        return None
+
+    if wandb is None:
+        raise ImportError(
+            "wandb is enabled in config but the package is not installed. "
+            "Install it with `pip install wandb`."
+        )
+
+    run = wandb.init(
+        project=wandb_config.get("project", "multitask-perception"),
+        entity=wandb_config.get("entity") or None,
+        name=wandb_config.get("run_name") or None,
+        job_type=wandb_config.get("job_type", "train-detector"),
+        tags=wandb_config.get("tags") or None,
+        notes=wandb_config.get("notes") or None,
+        mode=wandb_config.get("mode", os.environ.get("WANDB_MODE", "online")),
+        config={
+            **flatten_wandb_config({"train": train_config}),
+            **flatten_wandb_config({"data": data_config}),
+        },
+    )
+    return run
+
+
+def log_wandb_metrics(
+    run: Any | None,
+    epoch: int,
+    train_epoch_loss: float,
+    val_loss: float | None,
+    val_metrics: dict[str, float] | None,
+    current_lr: float,
+) -> None:
+    """Logs scalar metrics to W&B when a run is active."""
+    if run is None or wandb is None:
+        return
+
+    payload: dict[str, Any] = {
+        "epoch": epoch,
+        "train/epoch_loss": train_epoch_loss,
+        "train/epoch_lr": current_lr,
+    }
+    if val_loss is not None:
+        payload["val/loss"] = val_loss
+    if val_metrics:
+        for metric_name, metric_value in val_metrics.items():
+            if isinstance(metric_value, (int, float)):
+                payload[f"val/{metric_name}"] = metric_value
+
+    wandb.log(payload, step=epoch)
+
+
+def upload_wandb_artifact(
+    run: Any | None,
+    artifact_name: str,
+    artifact_type: str,
+    artifact_path: Path,
+    aliases: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Uploads a file artifact to W&B when enabled."""
+    if run is None or wandb is None or not artifact_path.exists():
+        return
+
+    artifact = wandb.Artifact(
+        name=artifact_name,
+        type=artifact_type,
+        metadata=metadata or {},
+    )
+    artifact.add_file(str(artifact_path), name=artifact_path.name)
+    run.log_artifact(artifact, aliases=aliases or None)
+
+
 def main() -> None:
     """Loads configs, trains the detector, logs metrics, and saves checkpoints."""
 
     data_config = load_yaml(ROOT / "configs" / "data" / "insta360_detection.yaml")
     train_config = load_yaml(ROOT / "configs" / "train" / "detector_demo.yaml")
+    wandb_run = init_wandb_run(train_config, data_config)
 
     # Set seeds
     set_seed(int(train_config.get("split_seed", 42)))
@@ -676,6 +774,14 @@ def main() -> None:
             val_metrics,
             current_lr,
         )
+        log_wandb_metrics(
+            wandb_run,
+            epoch + 1,
+            train_epoch_loss,
+            val_loss,
+            val_metrics,
+            current_lr,
+        )
 
         # Visualization
         if val_loader is not None and (epoch + 1) % vis_every_epochs == 0:
@@ -739,6 +845,18 @@ def main() -> None:
             epochs_without_improvement = 0
             best_path = checkpoint_dir / "best.pth"
             torch.save(torch.load(checkpoint_path), best_path)
+            upload_wandb_artifact(
+                wandb_run,
+                artifact_name="detector-best-checkpoint",
+                artifact_type="model",
+                artifact_path=best_path,
+                aliases=["best", f"epoch-{epoch + 1:03d}"],
+                metadata={
+                    "epoch": epoch + 1,
+                    "metric_name": early_stopping_metric,
+                    "metric_value": current_metric,
+                },
+            )
             logger.info(
                 f"New best checkpoint at epoch {epoch + 1}: "
                 f"{early_stopping_metric}={current_metric:.6f}"
@@ -773,7 +891,34 @@ def main() -> None:
     except Exception as e:
         logger.warning(f"Failed to generate plots: {e}")
 
+    upload_wandb_artifact(
+        wandb_run,
+        artifact_name="detector-last-checkpoint",
+        artifact_type="model",
+        artifact_path=checkpoint_dir / "last.pth",
+        aliases=["latest"],
+        metadata={"best_epoch": best_epoch, "best_metric_value": best_metric_value},
+    )
+    upload_wandb_artifact(
+        wandb_run,
+        artifact_name="detector-training-metrics",
+        artifact_type="metrics",
+        artifact_path=checkpoint_dir / "metrics.csv",
+        aliases=["latest"],
+        metadata={"best_epoch": best_epoch, "best_metric_value": best_metric_value},
+    )
+    upload_wandb_artifact(
+        wandb_run,
+        artifact_name="detector-training-metrics-jsonl",
+        artifact_type="metrics",
+        artifact_path=metrics_file,
+        aliases=["latest"],
+        metadata={"best_epoch": best_epoch, "best_metric_value": best_metric_value},
+    )
+
     writer.close()
+    if wandb_run is not None and wandb is not None:
+        wandb.finish()
     logger.info("Training complete")
 
 

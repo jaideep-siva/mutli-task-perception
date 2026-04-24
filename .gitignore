@@ -1,4 +1,6 @@
-/data/
+/data/*
+!/data/*.py
+!/data/README.md
 __pycache__/
 **/__pycache__/
 *.py[cod]
@@ -7,3 +9,8 @@ __pycache__/
 .vscode/
 
 /outputs/
+/artifacts/
+/checkpoints/
+/experiments/
+/mlruns/
+/mlflow.db

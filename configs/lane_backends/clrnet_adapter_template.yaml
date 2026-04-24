@@ -1,0 +1,8 @@
+adapter:
+  # Replace with an importable adapter from your CLRNet integration.
+  # The object must expose predict(image_bgr) and return either:
+  #   {"mask": np.ndarray, "confidence": float}
+  #   {"lanes": [[(x, y), ...]], "confidence": float}
+  #   or (lanes, confidence)
+  target: "your_clrnet_package.adapters:CLRNetEquirectAdapter"
+  kwargs: {}
