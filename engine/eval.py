@@ -49,7 +49,7 @@ def evaluate(
     artifact_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     model.eval()
-    metric = MeanAveragePrecision(iou_type="bbox")
+    metric = MeanAveragePrecision(iou_type="bbox", class_metrics=True)
     seg_scores: list[dict[str, Any]] = []
     seg_enabled = bool(cfg.get("segmentation", {}).get("enabled", True))
     sample_count = 0
@@ -62,7 +62,7 @@ def evaluate(
         det_preds = decode_detections(
             level_outputs=preds["detection"],
             image_size=(images.shape[-2], images.shape[-1]),
-            score_threshold=float(cfg["detection"].get("score_threshold", 0.25)),
+            score_threshold=0.01,  # low threshold for mAP; inference threshold is applied separately
             nms_threshold=float(cfg["detection"].get("nms_threshold", 0.5)),
             max_detections=int(cfg["detection"].get("max_detections", 100)),
         )
@@ -81,6 +81,16 @@ def evaluate(
             )
 
     det_result = metric.compute()
+
+    # Per-class detection AP — torchmetrics returns -1 for unseen classes
+    raw_per_class_ap = det_result.get("map_per_class", torch.tensor([]))
+    per_class_det_ap: list[float] = []
+    if raw_per_class_ap.numel() > 0:
+        per_class_det_ap = [
+            float(v) if float(v) >= 0.0 else 0.0
+            for v in raw_per_class_ap.reshape(-1).tolist()
+        ]
+
     per_class_count = int(cfg["segmentation"]["num_classes"])
     per_class_iou = [0.0 for _ in range(per_class_count)]
     per_class_dice = [0.0 for _ in range(per_class_count)]
@@ -99,6 +109,8 @@ def evaluate(
     results = {
         "det_mAP": float(det_result.get("map", torch.tensor(0.0)).item()),
         "det_mAP_50": float(det_result.get("map_50", torch.tensor(0.0)).item()),
+        "det_mAP_75": float(det_result.get("map_75", torch.tensor(0.0)).item()),
+        "per_class_det_ap": per_class_det_ap,
         "seg_iou": float(mean_iou),
         "seg_dice": float(mean_dice),
         "per_class_iou": per_class_iou,

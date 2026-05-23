@@ -14,6 +14,114 @@ from .collate import collate_fn
 from .transforms import TF, build_albumentations_transform
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _resolve_path(ref: str | Path, root: str | Path | None) -> Path:
+    path = Path(ref)
+    if path.is_absolute():
+        return path
+    return (Path(root) if root is not None else Path(".")) / path
+
+
+def read_manifest_samples(manifest_path: str | Path) -> list[dict[str, Any]]:
+    with Path(manifest_path).open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, dict):
+        data = data.get("samples", [])
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"Expected non-empty sample list in {manifest_path}")
+    return data
+
+
+def validate_manifest(
+    manifest_path: str | Path,
+    image_root: str | Path | None = None,
+    seg_root: str | Path | None = None,
+    num_classes: int | None = None,
+) -> dict[str, Any]:
+    samples = read_manifest_samples(manifest_path)
+    errors: list[str] = []
+    warnings: list[str] = []
+    seg_count = 0
+    box_count = 0
+
+    for index, sample in enumerate(samples):
+        image_ref = sample.get("image")
+        if not image_ref:
+            errors.append(f"sample {index}: missing image")
+            continue
+        image_path = _resolve_path(str(image_ref), image_root)
+        if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            warnings.append(f"sample {index}: unusual image extension {image_path.suffix}")
+        try:
+            with Image.open(image_path) as image:
+                image.verify()
+            with Image.open(image_path) as image:
+                width, height = image.size
+        except Exception as exc:
+            errors.append(f"sample {index}: unreadable image {image_path}: {exc}")
+            continue
+
+        boxes = sample.get("boxes", [])
+        labels = sample.get("labels", [])
+        if boxes is None:
+            boxes = []
+        if labels is None:
+            labels = []
+        if not isinstance(boxes, list) or not isinstance(labels, list):
+            errors.append(f"sample {index}: boxes and labels must be lists")
+            continue
+        if len(boxes) != len(labels):
+            errors.append(f"sample {index}: boxes length {len(boxes)} != labels length {len(labels)}")
+        for box_index, box in enumerate(boxes):
+            if not isinstance(box, list) or len(box) != 4:
+                errors.append(f"sample {index}: box {box_index} must contain four coordinates")
+                continue
+            x1, y1, x2, y2 = [float(value) for value in box]
+            if not (0.0 <= x1 < x2 <= width and 0.0 <= y1 < y2 <= height):
+                errors.append(f"sample {index}: box {box_index} outside image bounds {width}x{height}")
+        for label_index, label in enumerate(labels):
+            label_int = int(label)
+            if label_int < 0 or (num_classes is not None and label_int >= num_classes):
+                errors.append(f"sample {index}: label {label_index}={label_int} outside class range")
+        box_count += len(boxes)
+
+        seg_ref = sample.get("seg_mask")
+        if seg_ref:
+            seg_count += 1
+            mask_path = _resolve_path(str(seg_ref), seg_root)
+            try:
+                with Image.open(mask_path) as mask:
+                    mask.verify()
+                with Image.open(mask_path) as mask:
+                    if mask.size != (width, height):
+                        warnings.append(f"sample {index}: seg mask size {mask.size} differs from image {(width, height)}")
+            except Exception as exc:
+                errors.append(f"sample {index}: unreadable seg_mask {mask_path}: {exc}")
+        roi_ref = sample.get("seg_roi_mask")
+        if roi_ref:
+            roi_path = _resolve_path(str(roi_ref), seg_root)
+            try:
+                with Image.open(roi_path) as roi:
+                    roi.verify()
+            except Exception as exc:
+                errors.append(f"sample {index}: unreadable seg_roi_mask {roi_path}: {exc}")
+
+    report = {
+        "manifest": str(manifest_path),
+        "samples": len(samples),
+        "segmentation_samples": seg_count,
+        "boxes": box_count,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if errors:
+        preview = "; ".join(errors[:5])
+        raise ValueError(f"Manifest validation failed for {manifest_path}: {preview}")
+    return report
+
+
 class MultitaskDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
@@ -37,13 +145,7 @@ class MultitaskDataset(Dataset[dict[str, torch.Tensor]]):
         self.samples = self._load_manifest()
 
     def _load_manifest(self) -> list[dict[str, Any]]:
-        with self.manifest_path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if isinstance(data, dict):
-            data = data.get("samples", [])
-        if not isinstance(data, list) or not data:
-            raise ValueError(f"Expected non-empty sample list in {self.manifest_path}")
-        return data
+        return read_manifest_samples(self.manifest_path)
 
     def __len__(self) -> int:
         return len(self.samples)

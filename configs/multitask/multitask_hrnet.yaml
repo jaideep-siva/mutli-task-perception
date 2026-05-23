@@ -1,9 +1,11 @@
-# ResNet-18 backbone — fast baseline, fully pretrained
+# HRNet-W32 backbone — lightweight custom backbone, trained from scratch
+# NOTE: this is a simplified HRNet-style fallback (not the full HRNet paper arch)
+#       No ImageNet pretrained weights available — needs more epochs.
 # Detection classes (0-indexed): barrel, pedestrian, stop_sign, unknown, tire, pothole
 backbone:
-  name: resnet18
+  name: hrnet_w32
   in_channels: 3
-  pretrained: true
+  pretrained: false
 
 fpn:
   out_channels: 256
@@ -21,10 +23,10 @@ segmentation:
   num_classes: 2
   loss: ce
   ignore_index: -100
-  class_weights: [1.0, 3.0]   # lane is rare — upweight it
+  class_weights: [1.0, 3.0]
 
 optimizer:
-  lr: 0.0001
+  lr: 0.0002       # higher LR since training from scratch
 
 dataset:
   train_manifest: data/train_manifest.json
@@ -38,7 +40,7 @@ dataset:
 augment:
   albumentations:
     enabled: true
-    horizontal_flip_p: 0.0        # robot has fixed orientation
+    horizontal_flip_p: 0.0
     affine:
       enabled: true
       scale_limit: 0.08
@@ -74,14 +76,14 @@ mixed_precision:
 
 early_stopping:
   enabled: true
-  patience: 12
+  patience: 15       # more patience since training from scratch
   min_delta: 0.001
 
 label_source: manual
 roi_mode: none
 loss_weighting: manual
-epochs: 50
-batch_size: 4
+epochs: 60           # more epochs since no pretrained weights
+batch_size: 8        # lightweight model — can afford bigger batches
 log_every: 10
 seed: 42
 device: auto

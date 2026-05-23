@@ -1,7 +1,7 @@
-# ResNet-18 backbone — fast baseline, fully pretrained
+# Swin-B backbone — strong transformer, ImageNet pretrained
 # Detection classes (0-indexed): barrel, pedestrian, stop_sign, unknown, tire, pothole
 backbone:
-  name: resnet18
+  name: swin_b
   in_channels: 3
   pretrained: true
 
@@ -21,24 +21,27 @@ segmentation:
   num_classes: 2
   loss: ce
   ignore_index: -100
-  class_weights: [1.0, 3.0]   # lane is rare — upweight it
+  class_weights: [1.0, 3.0]
 
 optimizer:
-  lr: 0.0001
+  lr: 0.00005    # conservative LR for transformer fine-tuning
+
+freeze_backbone_epochs: 5   # heads-only warmup before unfreezing transformer
+backbone_lr_scale: 0.1      # backbone gets 10% of head LR after unfreeze
 
 dataset:
   train_manifest: data/train_manifest.json
   val_manifest: data/val_manifest.json
   image_root: .
   seg_root: .
-  image_size: [640, 1280]
+  image_size: [512, 1024]   # reduced from 640x1280 — cuts Swin-B patch count by 2.5x
   num_workers: 4
   normalize: true
 
 augment:
   albumentations:
     enabled: true
-    horizontal_flip_p: 0.0        # robot has fixed orientation
+    horizontal_flip_p: 0.0
     affine:
       enabled: true
       scale_limit: 0.08
@@ -81,7 +84,7 @@ label_source: manual
 roi_mode: none
 loss_weighting: manual
 epochs: 50
-batch_size: 4
+batch_size: 2        # attention is memory-hungry
 log_every: 10
 seed: 42
 device: auto

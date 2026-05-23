@@ -1,7 +1,7 @@
-# ResNet-18 backbone — fast baseline, fully pretrained
+# ConvNeXt-B backbone — high-accuracy, ImageNet pretrained
 # Detection classes (0-indexed): barrel, pedestrian, stop_sign, unknown, tire, pothole
 backbone:
-  name: resnet18
+  name: convnext_base
   in_channels: 3
   pretrained: true
 
@@ -21,10 +21,13 @@ segmentation:
   num_classes: 2
   loss: ce
   ignore_index: -100
-  class_weights: [1.0, 3.0]   # lane is rare — upweight it
+  class_weights: [1.0, 3.0]
 
 optimizer:
-  lr: 0.0001
+  lr: 0.00005    # lower LR for large pretrained model
+
+freeze_backbone_epochs: 5   # heads-only warmup before unfreezing backbone
+backbone_lr_scale: 0.1      # backbone gets 10% of head LR after unfreeze
 
 dataset:
   train_manifest: data/train_manifest.json
@@ -38,7 +41,7 @@ dataset:
 augment:
   albumentations:
     enabled: true
-    horizontal_flip_p: 0.0        # robot has fixed orientation
+    horizontal_flip_p: 0.0
     affine:
       enabled: true
       scale_limit: 0.08
@@ -81,7 +84,7 @@ label_source: manual
 roi_mode: none
 loss_weighting: manual
 epochs: 50
-batch_size: 4
+batch_size: 2        # large model — reduce batch to fit GPU memory
 log_every: 10
 seed: 42
 device: auto

@@ -1,5 +1,0 @@
-defaults:
-  - model: multitask_resnet18
-  - data: insta360_detection
-  - train: detection_only
-  - losses: detection

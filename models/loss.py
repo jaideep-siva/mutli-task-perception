@@ -5,8 +5,18 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchvision.ops import generalized_box_iou_loss
 
 from .segmentation_roi import roi_valid_mask
+
+
+def _focal_bce(logits: torch.Tensor, targets: torch.Tensor, gamma: float = 2.0, alpha: float = 0.25) -> torch.Tensor:
+    """Sigmoid focal loss for dense objectness — down-weights easy negatives."""
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    return (alpha_t * (1 - p_t) ** gamma * bce).mean()
 
 
 class MultiTaskLoss(nn.Module):
@@ -105,15 +115,55 @@ class MultiTaskLoss(nn.Module):
         total_obj = preds["p3"].new_tensor(0.0)
         total_box = preds["p3"].new_tensor(0.0)
         total_cls = preds["p3"].new_tensor(0.0)
+        input_h, input_w = image_size
         for level_name, pred in preds.items():
-            obj_target, box_target, cls_target, pos_mask = self._build_targets_for_level(pred, boxes_list, labels_list, image_size, level_name)
+            obj_target, box_target, cls_target, pos_mask = self._build_targets_for_level(
+                pred, boxes_list, labels_list, image_size, level_name
+            )
+            batch_size, _, feat_h, feat_w = pred.shape
+            stride_y = input_h / float(feat_h)
+            stride_x = input_w / float(feat_w)
+
             obj_logits = pred[:, 4]
-            box_logits = torch.relu(pred[:, :4].permute(0, 2, 3, 1))
+            box_logits = torch.relu(pred[:, :4].permute(0, 2, 3, 1))  # (B, H, W, 4) LTRB in stride units
             cls_logits = pred[:, 5:].permute(0, 2, 3, 1)
-            total_obj = total_obj + F.binary_cross_entropy_with_logits(obj_logits, obj_target, reduction="mean")
+
+            total_obj = total_obj + _focal_bce(obj_logits, obj_target)
+
             if pos_mask.any():
-                total_box = total_box + F.l1_loss(box_logits[pos_mask], box_target[pos_mask], reduction="mean")
-                total_cls = total_cls + F.cross_entropy(cls_logits[pos_mask], cls_target[pos_mask], reduction="mean")
+                # Cell centres for every spatial position
+                yi = torch.arange(feat_h, device=pred.device, dtype=pred.dtype)
+                xi = torch.arange(feat_w, device=pred.device, dtype=pred.dtype)
+                gy, gx = torch.meshgrid(yi, xi, indexing="ij")
+                cell_cx = (gx + 0.5) * stride_x  # (H, W)
+                cell_cy = (gy + 0.5) * stride_y
+                cell_cx = cell_cx.unsqueeze(0).expand(batch_size, -1, -1)  # (B, H, W)
+                cell_cy = cell_cy.unsqueeze(0).expand(batch_size, -1, -1)
+
+                pos_cx = cell_cx[pos_mask]  # (N,)
+                pos_cy = cell_cy[pos_mask]
+
+                # Decode predicted LTRB → absolute xyxy, clamped to image bounds
+                pl = box_logits[pos_mask]  # (N, 4)
+                pred_boxes = torch.stack([
+                    (pos_cx - pl[:, 0] * stride_x).clamp(0, input_w),
+                    (pos_cy - pl[:, 1] * stride_y).clamp(0, input_h),
+                    (pos_cx + pl[:, 2] * stride_x).clamp(0, input_w),
+                    (pos_cy + pl[:, 3] * stride_y).clamp(0, input_h),
+                ], dim=1)
+
+                # Decode target LTRB → absolute xyxy
+                tl = box_target[pos_mask]  # (N, 4)
+                tgt_boxes = torch.stack([
+                    pos_cx - tl[:, 0] * stride_x,
+                    pos_cy - tl[:, 1] * stride_y,
+                    pos_cx + tl[:, 2] * stride_x,
+                    pos_cy + tl[:, 3] * stride_y,
+                ], dim=1)
+
+                total_box = total_box + generalized_box_iou_loss(pred_boxes, tgt_boxes, reduction="mean")
+                cls_t = cls_target[pos_mask].clamp(0, self.num_det_classes - 1)
+                total_cls = total_cls + F.cross_entropy(cls_logits[pos_mask], cls_t, reduction="mean")
         return total_obj + total_box + total_cls
 
     def _build_targets_for_level(
@@ -140,25 +190,46 @@ class MultiTaskLoss(nn.Module):
             for box, label in zip(boxes, labels):
                 if label < 0 or label >= self.num_det_classes:
                     continue
-                width = float(box[2] - box[0])
-                height = float(box[3] - box[1])
-                if self._select_level(max(width, height)) != level_name:
+                x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                if self._select_level(max(x2 - x1, y2 - y1)) != level_name:
                     continue
-                center_x = float((box[0] + box[2]) * 0.5)
-                center_y = float((box[1] + box[3]) * 0.5)
-                grid_x = min(feat_w - 1, max(0, int(center_x / stride_x)))
-                grid_y = min(feat_h - 1, max(0, int(center_y / stride_y)))
-                cell_x = (grid_x + 0.5) * stride_x
-                cell_y = (grid_y + 0.5) * stride_y
-                obj_target[batch_idx, grid_y, grid_x] = 1.0
-                box_target[batch_idx, grid_y, grid_x] = torch.tensor([
-                    max((cell_x - float(box[0])) / stride_x, 0.0),
-                    max((cell_y - float(box[1])) / stride_y, 0.0),
-                    max((float(box[2]) - cell_x) / stride_x, 0.0),
-                    max((float(box[3]) - cell_y) / stride_y, 0.0),
-                ], device=pred.device, dtype=pred.dtype)
-                cls_target[batch_idx, grid_y, grid_x] = label
-                pos_mask[batch_idx, grid_y, grid_x] = True
+                # FCOS-style: assign every cell whose centre falls strictly inside the GT box
+                gx_lo = max(0, int(x1 / stride_x))
+                gx_hi = min(feat_w - 1, int((x2 - 1e-6) / stride_x))
+                gy_lo = max(0, int(y1 / stride_y))
+                gy_hi = min(feat_h - 1, int((y2 - 1e-6) / stride_y))
+                assigned = False
+                for gy in range(gy_lo, gy_hi + 1):
+                    for gx in range(gx_lo, gx_hi + 1):
+                        ccx = (gx + 0.5) * stride_x
+                        ccy = (gy + 0.5) * stride_y
+                        if not (x1 < ccx < x2 and y1 < ccy < y2):
+                            continue
+                        obj_target[batch_idx, gy, gx] = 1.0
+                        box_target[batch_idx, gy, gx] = torch.tensor([
+                            (ccx - x1) / stride_x,
+                            (ccy - y1) / stride_y,
+                            (x2 - ccx) / stride_x,
+                            (y2 - ccy) / stride_y,
+                        ], device=pred.device, dtype=pred.dtype)
+                        cls_target[batch_idx, gy, gx] = label
+                        pos_mask[batch_idx, gy, gx] = True
+                        assigned = True
+                if not assigned:
+                    # Fallback for very small objects: use the centre cell
+                    gx = min(feat_w - 1, max(0, int((x1 + x2) * 0.5 / stride_x)))
+                    gy = min(feat_h - 1, max(0, int((y1 + y2) * 0.5 / stride_y)))
+                    ccx = (gx + 0.5) * stride_x
+                    ccy = (gy + 0.5) * stride_y
+                    obj_target[batch_idx, gy, gx] = 1.0
+                    box_target[batch_idx, gy, gx] = torch.tensor([
+                        max((ccx - x1) / stride_x, 0.0),
+                        max((ccy - y1) / stride_y, 0.0),
+                        max((x2 - ccx) / stride_x, 0.0),
+                        max((y2 - ccy) / stride_y, 0.0),
+                    ], device=pred.device, dtype=pred.dtype)
+                    cls_target[batch_idx, gy, gx] = label
+                    pos_mask[batch_idx, gy, gx] = True
         return obj_target, box_target, cls_target, pos_mask
 
     @staticmethod
