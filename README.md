@@ -1,312 +1,278 @@
-# Multitask Perception Research Repository
+# Multi-Task Perception for Robotics
 
-This repository contains a multitask perception stack for robotics research. The current mainline model predicts object detections and lane/ground segmentation from equirectangular camera frames. The repository is in a strong development state: the core model and experimentation pipeline are mostly built, but deployment is not complete until the model is retrained on actual robot data and exported/integrated through ONNX, TensorRT, and ROS.
+Real-time object detection and lane segmentation from 360° equirectangular camera frames, built for mobile robotics deployment.
 
-## Section A: How to Use This Repository
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-### Project Overview
+---
 
-This project is for training and evaluating a perception model that can support a robot operating from wide-field camera input. It separates model code, dataset loading, training/evaluation logic, experiment launchers, preprocessing tools, and future deployment-facing demos.
+## What This Does
 
-The current system can:
+A single neural network that simultaneously:
 
-- Load manifest-based multitask datasets with RGB images, detection boxes, segmentation masks, confidence scores, and ROI masks.
-- Train a PyTorch multitask model with a backbone, FPN, detection head, and segmentation head.
-- Evaluate detection and segmentation metrics when labels are available.
-- Generate or convert lane supervision artifacts for equirectangular frames.
-- Run controlled backbone comparison experiments.
-- Run a live OpenCV/PyTorch demo scaffold through `live_inference_demo/`.
+1. **Detects objects** in 6 categories — barrel, pedestrian, stop sign, unknown obstacle, tire, pothole
+2. **Segments the drivable lane area** as a binary mask (lane vs. background)
 
-Still pending:
+The model consumes equirectangular (360°) camera frames at full resolution (640 × 1280 px) and is designed to run on-robot with GPU acceleration. An anchor-free FCOS-style detection head and a bilinear segmentation decoder share a common backbone and Feature Pyramid Network.
 
-- Retraining on data from the actual robot.
-- ONNX export.
-- TensorRT conversion.
-- ROS wrapper or ROS2 integration.
+---
 
-### Repo Blueprint
+## Results
 
-Plain-language map first:
+Backbone comparison trained on ~1,400 manually annotated frames:
 
-- `configs/`: settings files. Change these before changing Python code.
-- `data/`: dataset loading code and lightweight data documentation. Large local data should stay ignored by Git.
-- `models/`: the canonical multitask neural network.
-- `engine/`: training, validation, metrics, checkpointing, and MLflow hooks.
-- `scripts/`: command-line entry points that call the real code.
-- `tools/`: data preparation and lane supervision utilities.
-- `tests/`: smoke tests that check the main pipeline still runs.
-- `docs/`: folder guides, learning material, reports, and legacy documentation.
-- `live_inference_demo/`: OpenCV demo scaffold for live/video inference experiments.
-- `src/`: legacy Faster R-CNN detector demo path. Keep it working, but do not treat it as the canonical multitask path.
-- `outputs/`, `artifacts/`, `mlruns/`, `mlflow.db`: generated results, checkpoints, metrics, and experiment tracking state. These are ignored by Git.
-- `archive/`: non-mainline preserved material.
+| Backbone      | mAP   | mAP@50 | Lane IoU | Lane Dice | Latency  | FPS    | GPU Memory |
+| ------------- | ----- | ------ | -------- | --------- | -------- | ------ | ---------- |
+| **ResNet-18** | **0.248** | **0.559** | **0.901** | **0.945** | 15.9 ms | **62.9** | 452 MB |
+| ConvNeXt-Base | 0.224 | 0.461  | 0.884    | 0.933     | 206.4 ms | 4.8    | 1,771 MB   |
 
-Technical mainline:
+ResNet-18 is the recommended backbone — best speed/accuracy trade-off for embedded robotics deployment. Training used ~1,400 manually annotated 640 × 1280 frames; both runs triggered early stopping, so these numbers are conservative.
+
+### Training curves
+
+![ResNet-18 training curves](docs/assets/curves_resnet18.png)
+
+### Inference example
+
+![Inference sample](docs/assets/inference_sample.jpg)
+
+---
+
+## Architecture
 
 ```text
-configs/multitask/multitask_resnet18.yaml
-scripts/train.py
-scripts/run_experiments.py
-data/*
-models/*
-engine/*
-tools/equirect_lane_pipeline/*
+Equirectangular Frame  640 × 1280 px
+          │
+    ┌─────┴──────┐
+    │  Backbone  │   ResNet-18 · ConvNeXt-B · Swin-B · HRNet
+    └─────┬──────┘
+          │  C3, C4, C5 feature maps
+    ┌─────┴──────┐
+    │    FPN     │   Feature Pyramid Network → P3 (stride 8) · P4 (stride 16) · P5 (stride 32)
+    └──┬──────┬──┘
+       │      │
+  ┌────┴────┐ ┌──────┴──────┐
+  │Detection│ │Segmentation │
+  │  Head   │ │   Head      │
+  └────┬────┘ └──────┬──────┘
+       │              │
+Anchor-free        Binary lane mask
+FCOS boxes         640 × 1280 px
+6 classes
 ```
 
-### Getting Started From Zero
+- **Detection head** — 4 LTRB offsets + 1 objectness score + 6 class logits, decoded per FPN level then merged with NMS.
+- **Segmentation head** — bilinear upsampling from fused P3/P4/P5 features to full input resolution.
+- **Loss** — focal detection loss + cross-entropy (or Dice) segmentation loss, masked to a configurable ROI and optionally scaled by per-sample pseudo-label confidence.
 
-Prerequisites:
+See [`docs/architecture.md`](docs/architecture.md) for a full technical breakdown.
 
-- Python 3.10 or newer is recommended.
-- A working PyTorch installation.
-- CUDA is optional but strongly recommended for real training.
-- Basic command-line familiarity.
+---
 
-Create and activate an environment:
+## Quick Start
+
+### 1. Clone and create a virtual environment
 
 ```bash
+git clone https://github.com/yourname/mutli-task-perception.git
+cd mutli-task-perception
+
 python -m venv .venv
+
+# Windows
 .venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
-Install the expected Python packages. The exact environment has not yet been frozen into a top-level lockfile, so use the imports in the repo as the current dependency source:
+### 2. Prepare your dataset
 
-```bash
-pip install torch torchvision torchmetrics pyyaml pillow numpy opencv-python mlflow albumentations pytest
-```
-
-Optional packages:
-
-```bash
-pip install wandb tensorboard matplotlib
-```
-
-Recommended reading order before running anything:
-
-1. `README.md`
-2. `docs/folder_guides/README.md`
-3. `docs/learning/repo_orientation_for_beginners.md`
-4. `configs/multitask/multitask_resnet18.yaml`
-5. `scripts/train.py`
-6. `data/dataset.py`
-7. `models/multitask_model.py`
-8. `engine/train.py`
-9. `docs/report/project_report.md`
-
-### Quickstart Workflows
-
-Dataset preparation:
+Build a training manifest from your annotated images (see [Dataset Format](#dataset-format) below for the schema). If you already have images, detection annotations, and lane masks, point the manifest builder at them:
 
 ```bash
 python tools/equirect_lane_pipeline/build_multitask_manifest.py \
-  --images_dir path/to/images \
+  --images_dir path/to/frames \
   --detection_annotations path/to/detections.json \
   --lane_records path/to/lane_records.jsonl \
-  --train_manifest outputs/my_run/train_manifest.json \
-  --val_manifest outputs/my_run/val_manifest.json \
+  --train_manifest work/train_manifest.json \
+  --val_manifest work/val_manifest.json \
   --val_ratio 0.2 \
-  --require_segmentation \
   --shared_roi_mask path/to/roi_mask.png
 ```
 
-Training:
+### 3. Train
 
 ```bash
 python scripts/train.py \
   --config configs/multitask/multitask_resnet18.yaml \
-  --train_manifest outputs/my_run/train_manifest.json \
-  --val_manifest outputs/my_run/val_manifest.json \
-  --output_dir outputs/my_run/resnet18 \
+  --train_manifest work/train_manifest.json \
+  --val_manifest work/val_manifest.json \
+  --output_dir outputs/resnet18_run \
   --device auto
 ```
 
-Fast smoke training:
+Training writes checkpoints, a `metrics.jsonl` log, and an MLflow run (if `mlflow` is installed) to the output directory.
+
+**Smoke test** — verify the pipeline runs before committing to a full training run:
 
 ```bash
 python scripts/train.py \
   --config configs/multitask/multitask_resnet18.yaml \
-  --train_manifest outputs/my_run/train_manifest.json \
-  --val_manifest outputs/my_run/val_manifest.json \
+  --train_manifest work/train_manifest.json \
+  --val_manifest work/val_manifest.json \
   --output_dir outputs/smoke \
-  --epochs 1 \
-  --batch_size 1 \
-  --max_steps_per_epoch 1 \
-  --device cpu
+  --epochs 1 --batch_size 1 --max_steps_per_epoch 1 --device cpu
 ```
 
-Backbone comparison:
+### 4. Compare backbones
 
 ```bash
-python scripts/run_experiments.py \
+python scripts/run_backbone_sweep.py \
   --config configs/multitask/multitask_resnet18.yaml \
-  --train_manifest outputs/my_run/train_manifest.json \
-  --val_manifest outputs/my_run/val_manifest.json \
-  --output_dir outputs/comparisons/my_backbone_sweep \
-  --batch_size 1 \
-  --device auto
+  --train_manifest work/train_manifest.json \
+  --val_manifest work/val_manifest.json \
+  --output_dir outputs/backbone_sweep
+
+python scripts/generate_report.py --sweep_dir outputs/backbone_sweep
 ```
 
-Validation/evaluation happens automatically during training when `dataset.val_manifest` is set. The evaluation code lives in `engine/eval.py`.
-
-Inference/demo:
+### 5. Export to ONNX
 
 ```bash
-cd live_inference_demo
-python app.py --video path/to/demo.mp4
+python scripts/export_onnx.py \
+  --checkpoint outputs/resnet18_run/best.pth \
+  --config configs/multitask/multitask_resnet18.yaml \
+  --output_path outputs/model.onnx
 ```
 
-Configs live under `configs/`. Outputs, logs, checkpoints, generated masks, comparisons, and MLflow runs should go under `outputs/`, `artifacts/`, `mlruns/`, or another ignored experiment directory.
+The script exports the model and verifies numerical divergence against the PyTorch reference (expected max absolute difference < 1e-5). See [`inference/README.md`](inference/README.md) for TensorRT conversion and the C++ deployment pipeline.
 
-### If You Are Totally New
+---
 
-A config file is a YAML file that stores settings such as model type, image size, learning rate, batch size, and dataset paths. In this repo, configs let you change experiments without rewriting Python code.
+## Dataset Format
 
-A checkpoint is a saved copy of model weights plus training metadata. You use checkpoints to resume work, compare experiments, or run inference.
+Training is manifest-driven. A manifest is a JSON list where each entry describes one annotated frame:
 
-Training means showing labeled examples to the model so it can update its weights.
+```json
+[
+  {
+    "image": "path/to/frame.jpg",
+    "boxes": [[10, 20, 50, 80], [120, 60, 200, 150]],
+    "labels": [1, 0],
+    "seg_mask": "path/to/lane_mask.png",
+    "seg_confidence": 0.92,
+    "seg_roi_mask": "path/to/roi_mask.png"
+  }
+]
+```
 
-Inference means using a trained model to make predictions on new images or video.
+| Field             | Type                        | Description                                                |
+| ----------------- | --------------------------- | ---------------------------------------------------------- |
+| `image`           | string                      | Path to the RGB frame (relative to repo root)              |
+| `boxes`           | list of [x1, y1, x2, y2]   | Detection boxes in pixel coordinates                       |
+| `labels`          | list of int                 | Class index per box (see table below)                      |
+| `seg_mask`        | string                      | Single-channel PNG: 0 = background, 1 = lane               |
+| `seg_confidence`  | float 0–1                   | Pseudo-label confidence — scales segmentation loss weight  |
+| `seg_roi_mask`    | string                      | Binary mask PNG: 255 = supervise, 0 = ignore               |
 
-Evaluation means measuring predictions against labels. For this repo, that can include detection mAP and segmentation IoU/Dice, depending on which labels exist.
+Frames with empty `boxes` / `labels` are valid for segmentation-only training. See [`data/README.md`](data/README.md) for the full schema and dataset loader API.
 
-Export means converting a trained PyTorch model into a deployment-friendly format such as ONNX and then TensorRT.
+### Detection class indices
 
-Scripts and modules relate like this: files in `scripts/` are thin command-line doors. They call reusable code in `data/`, `models/`, `engine/`, and `tools/`.
+| Index | Class       |
+| ----- | ----------- |
+| 0     | barrel      |
+| 1     | pedestrian  |
+| 2     | stop_sign   |
+| 3     | unknown     |
+| 4     | tire        |
+| 5     | pothole     |
 
-### Common Pitfalls And Troubleshooting
+---
 
-- Path issues: prefer paths relative to the repo root unless a script says otherwise.
-- Empty manifests: `data.MultitaskDataset` expects a non-empty JSON list or an object with a non-empty `samples` list.
-- Detection metrics unavailable: if validation samples have empty `boxes` and `labels`, detection mAP cannot support backbone selection.
-- Segmentation masks not aligned: check resize settings and inspect lane QC previews before training.
-- Config mismatch: make sure `segmentation.num_classes`, mask values, and `detection.num_classes` match the dataset.
-- CUDA unavailable: `device: auto` falls back to CPU, but real training may be slow.
-- Generated output clutter: `outputs/`, `artifacts/`, `mlruns/`, and `mlflow.db` are generated and ignored; do not treat them as source.
-- Live demo checkpoint loading: `live_inference_demo/` is a demo scaffold, not the final ROS integration.
+## Configuration
 
-### Recommended Workflow For New Contributors
+All experiment settings live in YAML files under `configs/multitask/`. Key options in `multitask_resnet18.yaml`:
 
-Read first:
+| Key                           | Default    | Description                                          |
+| ----------------------------- | ---------- | ---------------------------------------------------- |
+| `backbone.name`               | `resnet18` | `resnet18`, `convnext_base`, `swin_b`, `hrnet_w32`   |
+| `detection.num_classes`       | `6`        | Number of object categories                          |
+| `optimizer.lr`                | `0.0001`   | Learning rate (AdamW with cosine annealing)          |
+| `epochs`                      | `50`       | Maximum training epochs                              |
+| `batch_size`                  | `4`        | Samples per batch                                    |
+| `device`                      | `auto`     | `auto`, `cuda`, or `cpu`                             |
+| `mixed_precision.enabled`     | `true`     | FP16 mixed precision (requires CUDA)                 |
+| `early_stopping.patience`     | `12`       | Stop if val loss doesn't improve for N epochs        |
+| `segmentation.loss`           | `ce`       | `ce` (cross-entropy) or `dice`                       |
 
-- `docs/folder_guides/README.md`
-- `docs/learning/repo_orientation_for_beginners.md`
-- `docs/report/project_report.md`
-- `configs/multitask/multitask_resnet18.yaml`
+Change config values rather than editing Python code wherever possible.
 
-Safe to modify:
+---
 
-- New configs under `configs/`.
-- New documentation under `docs/`.
-- New experiment output folders under `outputs/`.
-- Conservative additions to tests.
+## Project Layout
 
-Change carefully:
+```text
+mutli-task-perception/
+├── configs/                         # YAML experiment configs — edit these first
+│   └── multitask/
+│       ├── multitask_resnet18.yaml  # Recommended baseline
+│       ├── multitask_convnext.yaml
+│       ├── multitask_swinb.yaml
+│       └── multitask_hrnet.yaml
+├── data/                            # Manifest-driven dataset loader
+├── models/                          # Neural network: backbone, FPN, heads, loss
+├── engine/                          # Training loop, evaluation, metrics
+├── scripts/                         # Command-line entry points
+│   ├── train.py                     # Train one config
+│   ├── run_backbone_sweep.py        # Compare multiple backbones
+│   ├── export_onnx.py               # Export to ONNX
+│   ├── visualize_inference.py       # Side-by-side ONNX inference comparison
+│   └── generate_report.py           # Backbone sweep comparison report
+├── tools/
+│   └── equirect_lane_pipeline/      # Frame extraction and pseudo-label generation
+├── inference/                       # ONNX → TensorRT deployment
+├── tests/                           # Smoke tests
+└── docs/                            # Architecture and deployment reference
+```
 
-- `models/loss.py`
-- `models/detection_postprocess.py`
-- `data/dataset.py`
-- `engine/train.py`
-- `engine/eval.py`
-- Legacy detector code under `src/`, because it supports the older demo path.
+---
 
-Do not casually change:
+## Running Tests
 
-- Manifest schema.
-- Checkpoint format.
-- Model output keys.
-- ROI mask semantics.
-- Class counts without updating configs and labels together.
+```bash
+pytest tests/
+```
 
-## Section B: Project Status And Development Checklist
+The smoke test validates dataset loading, model forward pass, loss computation, and metrics without needing data on disk.
 
-### Overall Status
+---
 
-- [x] Core model building mostly complete.
-- [x] Canonical multitask training entry point exists.
-- [x] Manifest-driven dataset loader exists.
-- [x] Segmentation ROI masking and confidence-weighted supervision exist.
-- [x] Backbone comparison tooling exists.
-- [x] Legacy detector path preserved.
-- [~] Evaluation flow exists, but available experiment evidence is limited by label coverage.
-- [~] Live inference demo exists as a scaffold, not a deployment integration.
-- [ ] Retraining on actual robot data.
-- [ ] ONNX conversion.
-- [ ] TensorRT conversion.
-- [ ] ROS wrapper / integration.
+## Troubleshooting
 
-### Data Pipeline Status
+**`CUDA unavailable`** — `device: auto` falls back to CPU automatically. CPU training is slow but works.
 
-- [x] Manifest schema supports images, boxes, labels, segmentation masks, confidence, and ROI masks.
-- [x] Equirectangular lane preprocessing tools exist.
-- [x] Manual tape-label manifests exist in generated outputs.
-- [~] Current observed manual tape-label split is small: 38 train samples and 9 validation samples.
-- [ ] Actual robot data retraining dataset still needs to be collected/curated.
-- [ ] Dataset versioning policy still needs to be formalized.
+**Empty manifest error** — `MultitaskDataset` requires at least one sample. Verify your manifest file is a non-empty JSON list and all paths resolve from the repo root.
 
-### Model Architecture Status
+**Config mismatch** — changing `detection.num_classes` or `segmentation.num_classes` requires rebuilding all checkpoints. Model output shapes are fixed at construction time from the config.
 
-- [x] Canonical multitask model uses backbone + FPN + detection head + segmentation head.
-- [x] ResNet-18 baseline is configured.
-- [x] ConvNeXt-Base and Swin-B backbones are available for comparison.
-- [~] `hrnet_w32` is a lightweight fallback, not a true HRNet implementation.
-- [ ] Deployment-specific model constraints for ONNX/TensorRT still need validation.
+**Segmentation masks misaligned** — verify your masks were generated at the same resolution as `dataset.image_size` in your config (default: 640 × 1280).
 
-### Training Status
+---
 
-- [x] `scripts/train.py` trains the canonical multitask stack.
-- [x] Training writes checkpoints and metrics summaries.
-- [x] MLflow hooks are present when MLflow is installed.
-- [~] Current comparison evidence appears to come from small manual lane/tape data, not final robot data.
-- [ ] Full retraining on actual robot data is pending.
+## Roadmap
 
-### Evaluation Status
+- [ ] Expand training data with robot-collected and pseudo-labelled frames
+- [ ] ONNX export validation against TensorRT engine on Jetson Orin
+- [ ] ROS 2 node wrapper for real-time robot integration
+- [ ] INT8 quantisation and latency benchmarking
 
-- [x] Segmentation IoU and Dice are implemented.
-- [x] Detection mAP is wired through TorchMetrics.
-- [~] Current manual tape-label comparison reports detection mAP as unavailable because the observed manifests contain empty detection boxes.
-- [ ] Final detection evaluation requires robot data with ground-truth boxes.
-- [ ] Final deployment acceptance metrics need to be defined.
+---
 
-### Deployment/Export Status
+## License
 
-- [~] Live inference demo scaffold exists.
-- [ ] ONNX conversion is pending.
-- [ ] TensorRT conversion is pending.
-- [ ] Runtime benchmarking on target hardware is pending.
-- [ ] Model export tests are pending.
-
-### Robotics Integration Status
-
-- [~] Repository is organized with deployment in mind.
-- [~] Live demo proves basic video/camera plumbing concepts.
-- [ ] ROS wrapper / integration is pending.
-- [ ] Robot sensor calibration and message contracts are pending.
-- [ ] End-to-end robot validation is pending.
-
-### Documentation Status
-
-- [x] Top-level README rewritten for beginners and maintainers.
-- [x] Folder-level technical guides added under `docs/folder_guides/`.
-- [x] Learning documents added under `docs/learning/`.
-- [x] Current-state technical report added under `docs/report/`.
-- [~] Dependency/environment freeze remains pending.
-
-### Recommended Next Steps
-
-1. Freeze the Python environment into a top-level `requirements.txt` or equivalent lockfile.
-2. Collect and curate actual robot data with detection and segmentation labels.
-3. Retrain the ResNet-18 baseline on robot data.
-4. Re-run backbone comparisons with complete labels.
-5. Add ONNX export and export validation tests.
-6. Add TensorRT conversion and latency benchmarking.
-7. Build the ROS wrapper around the validated exported model.
-8. Run robot-in-the-loop evaluation and document acceptance criteria.
-
-### Risks, Blockers, And Technical Debt
-
-- Current strongest experiment evidence is from a small manual tape-label dataset, not final robot data.
-- Detection mAP is unavailable for observed manual tape-label comparisons because boxes are empty.
-- ONNX/TensorRT compatibility has not been validated.
-- Live inference is a demo scaffold and should not be confused with ROS deployment.
-- Some generated output directories contain locked temp folders on Windows; they should remain ignored and can be cleaned outside active runs.
-- There is not yet a top-level frozen dependency file.
+MIT — see [LICENSE](LICENSE).

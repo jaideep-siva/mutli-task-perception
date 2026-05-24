@@ -1,10 +1,12 @@
 # Equirectangular Lane Supervision Pipeline
 
-This path assumes the production model ingests equirectangular frames directly. Frame extraction, pseudo-label generation, ROI masking, training, validation, and evaluation all stay in equirectangular image space. No perspective unwarping is performed by these tools.
+Converts raw drive videos into training-ready manifests for the multitask model. Everything stays in equirectangular image space — no perspective unwarping is performed.
 
-## Workflow
+The full pipeline runs in eight steps. Steps 1–5 produce manifests. Steps 6–7 train and compare models. Step 8 is a one-command orchestrator that wraps the entire flow.
 
-### 1. Extract Frames
+---
+
+## Step 1 — Extract Frames
 
 ```bash
 python tools/equirect_lane_pipeline/extract_frames.py \
@@ -15,43 +17,44 @@ python tools/equirect_lane_pipeline/extract_frames.py \
   --resize_w 1280
 ```
 
-Outputs `frames/` and `metadata.jsonl`.
+Outputs `frames/` (JPEG files) and `metadata.jsonl` (per-frame timestamps and filenames).
 
-### 2. Build ROI Mask
+---
 
-Manual equirectangular driving band:
+## Step 2 — Build an ROI Mask
+
+The ROI mask restricts lane supervision to the part of the frame where lanes actually appear (typically the lower half). Pixels outside the ROI contribute zero gradient during training.
+
+**Band mode** (rectangular region):
 
 ```bash
 python tools/equirect_lane_pipeline/build_roi_masks.py \
-  --image_h 640 \
-  --image_w 1280 \
+  --image_h 640 --image_w 1280 \
   --mode manual_band \
-  --top 320 \
-  --bottom 640 \
-  --left 0 \
-  --right 1280 \
+  --top 320 --bottom 640 --left 0 --right 1280 \
   --output_mask work/equirect_run/roi/roi_mask.png
 ```
 
-Polygon ROI:
+**Polygon mode** (arbitrary shape from a JSON point list):
 
 ```bash
 python tools/equirect_lane_pipeline/build_roi_masks.py \
-  --image_h 640 \
-  --image_w 1280 \
+  --image_h 640 --image_w 1280 \
   --mode polygon \
   --polygon_json roi_points.json \
   --output_mask work/equirect_run/roi/roi_mask.png
 ```
 
-ROI mask values are 255 for valid lane-supervision pixels and 0 elsewhere.
+Output pixel values: 255 = valid, 0 = ignored.
 
-### 3. Generate Lane Pseudo-Labels
+---
+
+## Step 3 — Generate Lane Pseudo-Labels
 
 ```bash
 python tools/equirect_lane_pipeline/generate_lane_masks.py \
   --backend clrnet \
-  --frames_dir work/equirect_run/frames/frames \
+  --frames_dir work/equirect_run/frames \
   --output_dir work/equirect_run/lane_labels \
   --config configs/lane_backends/opencv_equirect_lane.yaml \
   --device auto \
@@ -61,19 +64,21 @@ python tools/equirect_lane_pipeline/generate_lane_masks.py \
   --save_overlay
 ```
 
-Backends are adapter-based: `dummy`, `clrnet`, and `laneatt`. `dummy` is only for plumbing. `configs/lane_backends/opencv_equirect_lane.yaml` wires a runnable OpenCV-based automated extractor through the existing `clrnet` backend slot. `clrnet` and `laneatt` can also load project-specific neural adapters from `--config`; see `configs/lane_backends/*_adapter_template.yaml`.
-
-The imported adapter must expose `predict(image_bgr)` and return one of:
+**Backends**: `dummy` (plumbing test only), `clrnet`, `laneatt`. The `clrnet` slot also accepts any custom adapter via `--config` as long as the adapter exposes a `predict(image_bgr)` method that returns one of:
 
 ```python
 {"mask": mask_array, "confidence": 0.91}
-{"lanes": [[(x0, y0), (x1, y1)]], "confidence": 0.91}
+{"lanes": [[(x0, y0), (x1, y1), ...]], "confidence": 0.91}
 (lanes, confidence)
 ```
 
-Dense masks are converted to binary values, and lane point sequences are rasterized with `--mask_thickness`.
+Dense masks are binarised; lane point sequences are rasterised with `--mask_thickness` pixels.
 
-### 4. Filter Lane Masks
+---
+
+## Step 4 — Filter Lane Masks
+
+Removes low-quality pseudo-labels before training:
 
 ```bash
 python tools/equirect_lane_pipeline/filter_lane_masks.py \
@@ -84,11 +89,15 @@ python tools/equirect_lane_pipeline/filter_lane_masks.py \
   --drop_empty_masks
 ```
 
-### 5. Build Multitask Manifests
+---
+
+## Step 5 — Build Training Manifests
+
+Combines images, detection annotations, and filtered lane records into train/val manifests:
 
 ```bash
 python tools/equirect_lane_pipeline/build_multitask_manifest.py \
-  --images_dir work/equirect_run/frames/frames \
+  --images_dir work/equirect_run/frames \
   --detection_annotations data/detections.json \
   --lane_records work/equirect_run/lane_labels/filtered_records.jsonl \
   --train_manifest work/equirect_run/train_manifest.json \
@@ -98,22 +107,24 @@ python tools/equirect_lane_pipeline/build_multitask_manifest.py \
   --shared_roi_mask work/equirect_run/roi/roi_mask.png
 ```
 
-Manifest schema:
+Manifest schema per sample:
 
 ```json
-[
-  {
-    "image": "path/to/image.jpg",
-    "boxes": [[10, 20, 50, 80]],
-    "labels": [1],
-    "seg_mask": "path/to/mask.png",
-    "seg_confidence": 0.92,
-    "seg_roi_mask": "path/to/roi_mask.png"
-  }
-]
+{
+  "image": "path/to/frame.jpg",
+  "boxes": [[10, 20, 50, 80]],
+  "labels": [1],
+  "seg_mask": "path/to/lane_mask.png",
+  "seg_confidence": 0.92,
+  "seg_roi_mask": "path/to/roi_mask.png"
+}
 ```
 
-### 6. Train One Config
+See [`data/README.md`](../../data/README.md) for the full field reference.
+
+---
+
+## Step 6 — Train One Config
 
 ```bash
 python scripts/train.py \
@@ -122,31 +133,26 @@ python scripts/train.py \
   --val_manifest work/equirect_run/val_manifest.json
 ```
 
-### 7. Controlled Backbone Sweep
+---
+
+## Step 7 — Backbone Sweep
 
 ```bash
-python scripts/run_experiments.py \
+python scripts/run_backbone_sweep.py \
   --config configs/multitask/multitask_resnet18.yaml \
   --train_manifest work/equirect_run/train_manifest.json \
   --val_manifest work/equirect_run/val_manifest.json \
-  --label_source clrnet \
-  --roi_mode manual_band \
   --output_dir work/equirect_run/experiments
 ```
 
-The launcher runs:
+Trains ResNet-18, ConvNeXt-Base, and Swin-B (all with detection + segmentation). Add `--include_exploratory` to also run the HRNet fallback.
 
-- Phase A: `resnet18` detection-only and detection+segmentation
-- Phase A: `convnext_base` detection-only and detection+segmentation
-- Phase A: `swin_b` detection-only and detection+segmentation
-- Optional exploratory: `hrnet_w32` detection+segmentation when `--include_exploratory` is used with `scripts/run_experiments.py`
+---
 
-`hrnet_w32` is marked exploratory because the current implementation is a lightweight fallback, not a true upstream HRNet.
-
-### 8. Full Orchestration
+## Step 8 — Full Orchestration (single command)
 
 ```bash
-python scripts/run_phase_a_equirect_baselines.py \
+python scripts/retrain_all_backbones.py \
   --input_video data/raw/drive.mp4 \
   --detection_annotations data/detections.json \
   --work_dir work/equirect_run \
@@ -161,22 +167,28 @@ python scripts/run_phase_a_equirect_baselines.py \
   --roi_bottom 640
 ```
 
-## ROI-Masked Segmentation Loss
+---
 
-`models/loss.py` computes unreduced CE by default, then applies the binary ROI mask and per-sample pseudo-label confidence before reducing over valid pixels. Pixels outside the ROI do not contribute gradient. Dice loss is also supported with valid-region weighting via:
+## Advanced: ROI-Masked Segmentation Loss
+
+`models/loss.py` computes unreduced cross-entropy, then applies the binary ROI mask before averaging — pixels outside the ROI never contribute gradient. Dice loss is also supported:
 
 ```yaml
 segmentation:
   loss: dice
 ```
 
-## Confidence-Weighted Pseudo-Labels
+---
 
-Each manifest row may include `seg_confidence`. Low-confidence masks still train if retained by filtering, but their segmentation loss is scaled down. This is per-sample pseudo-label confidence, not class weighting.
+## Advanced: Confidence-Weighted Pseudo-Labels
 
-## Seam-Aware Augmentation
+Each manifest entry may include a `seg_confidence` float. The segmentation loss for that sample is scaled by this value at training time. This allows low-confidence pseudo-labels to contribute without dominating the gradient signal.
 
-Equirectangular images are horizontally cyclic. `dataset.py` supports optional horizontal circular shift:
+---
+
+## Advanced: Seam-Aware Augmentation
+
+Equirectangular images are horizontally cyclic. Enable circular shift augmentation to exploit this:
 
 ```yaml
 augment:
@@ -186,4 +198,4 @@ augment:
     shift_boxes: false
 ```
 
-Images, segmentation masks, and ROI masks are shifted with wrap-around. Detection box shifting is disabled by default because wrapped boxes can split across the seam; enable `shift_boxes` only if your detection labels can tolerate seam wrapping behavior.
+Images, segmentation masks, and ROI masks are all shifted with wrap-around. Detection box shifting is disabled by default because boxes that cross the seam are split — enable `shift_boxes` only if your labels can tolerate that behaviour.
