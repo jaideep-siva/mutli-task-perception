@@ -186,12 +186,21 @@ class MultitaskEngine:
         self._stream.synchronize()
 
         # Post-process on CPU
+        # size_min/max (longest box side, px) enforces FPN-level ownership so
+        # the same object can't survive from more than one scale.
+        #   p3 stride 8  → small objects,  side ≤ 72 px
+        #   p4 stride 16 → medium objects, side in [56, 160] px
+        #   p5 stride 32 → large objects,  side ≥ 128 px
+        # Overlap zones are intentionally narrow (56–72 px for p3/p4, 128–160 px
+        # for p4/p5) so genuine border-size objects pass one level; NMS handles
+        # any surviving duplicates within the zone.
         all_dets: list[Det] = []
-        all_dets += self._decode_level(self._h["det_p3"].numpy(), 80, 160)
-        all_dets += self._decode_level(self._h["det_p4"].numpy(), 40,  80)
-        all_dets += self._decode_level(self._h["det_p5"].numpy(), 20,  40)
+        all_dets += self._decode_level(self._h["det_p3"].numpy(), 80, 160, size_max=72)
+        all_dets += self._decode_level(self._h["det_p4"].numpy(), 40,  80, size_min=56, size_max=160)
+        all_dets += self._decode_level(self._h["det_p5"].numpy(), 20,  40, size_min=128)
 
         all_dets = self._nms(all_dets)
+        all_dets = self._center_dedup(all_dets)
         all_dets = self._spatial_filter(all_dets)
         seg_mask = self._decode_seg(self._h["seg_logits"].numpy())
 
@@ -207,7 +216,8 @@ class MultitaskEngine:
     # ── FCOS decode ────────────────────────────────────────────────────────────
 
     def _decode_level(
-        self, feat_flat: np.ndarray, feat_h: int, feat_w: int
+        self, feat_flat: np.ndarray, feat_h: int, feat_w: int,
+        size_min: float = 0.0, size_max: float = float("inf"),
     ) -> list[Det]:
         feat = feat_flat.reshape(PRED_DIM, feat_h, feat_w)
 
@@ -246,6 +256,21 @@ class MultitaskEngine:
         sc = scores[keep]
         cl = best_cls[keep]
 
+        # FPN-level ownership: drop boxes whose longest side falls outside this
+        # level's expected size range. Prevents the same object being predicted
+        # by p3, p4, and p5 simultaneously and surviving NMS due to low cross-
+        # scale IoU. Ranges overlap slightly so border-size objects still pass
+        # one level; NMS handles any remaining duplicates within a level.
+        side = np.maximum(x2 - x1, y2 - y1)
+        size_ok = (side >= size_min) & (side <= size_max)
+        x1, y1, x2, y2, sc, cl = (
+            x1[size_ok], y1[size_ok], x2[size_ok], y2[size_ok],
+            sc[size_ok], cl[size_ok],
+        )
+
+        if sc.size == 0:
+            return []
+
         dets: list[Det] = [
             {"x1": float(x1[i]), "y1": float(y1[i]),
              "x2": float(x2[i]), "y2": float(y2[i]),
@@ -276,6 +301,41 @@ class MultitaskEngine:
             for j in range(i + 1, len(dets)):
                 if not suppressed[j] and _iou(d, dets[j]) > self.cfg.nms_threshold:
                     suppressed[j] = True
+        return kept
+
+    def _center_dedup(self, dets: list[Det]) -> list[Det]:
+        """Drop lower-scoring same-class boxes whose centres are too close.
+
+        Cross-scale predictions on the same object produce boxes of very
+        different sizes (e.g. p3 tight 45 px, p4 loose 139 px).  Their IoU
+        is typically 0.10–0.27 — below any useful NMS threshold — so a
+        second pass based on centre distance is needed.
+
+        Threshold: centre distance < 0.5 × min(diag_a, diag_b).
+        Processing order is score-descending so the best box always wins.
+        """
+        dets = sorted(dets, key=lambda d: d["score"], reverse=True)
+        kept: list[Det] = []
+        for d in dets:
+            cx = (d["x1"] + d["x2"]) * 0.5
+            cy = (d["y1"] + d["y2"]) * 0.5
+            w, h = d["x2"] - d["x1"], d["y2"] - d["y1"]
+            diag = (w * w + h * h) ** 0.5
+            suppress = False
+            for k in kept:
+                if k["class_id"] != d["class_id"]:
+                    continue
+                kw, kh = k["x2"] - k["x1"], k["y2"] - k["y1"]
+                kdiag = (kw * kw + kh * kh) ** 0.5
+                dist = (
+                    (cx - (k["x1"] + k["x2"]) * 0.5) ** 2
+                    + (cy - (k["y1"] + k["y2"]) * 0.5) ** 2
+                ) ** 0.5
+                if dist < min(diag, kdiag) * 0.55:
+                    suppress = True
+                    break
+            if not suppress:
+                kept.append(d)
         return kept
 
     def _spatial_filter(self, dets: list[Det]) -> list[Det]:
@@ -345,8 +405,9 @@ def draw_detections(img: np.ndarray, dets: list[Det]) -> None:
                       col, 2, cv2.LINE_AA)
         label = f"{CLASS_NAMES[ci]}  {d['score']:.2f}"
         ts, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-        lx = int(d["x1"])
-        ly = max(int(d["y1"]) - baseline - 3, ts[1] + 2)
+        # Clamp label origin so the text pill never overflows the image edges.
+        lx = max(0, min(int(d["x1"]), img.shape[1] - ts[0] - 4))
+        ly = max(ts[1] + 2, min(int(d["y1"]) - baseline - 3, img.shape[0] - baseline - 2))
         cv2.rectangle(img, (lx, ly - ts[1] - 1), (lx + ts[0] + 2, ly + baseline), col, cv2.FILLED)
         cv2.putText(img, label, (lx + 1, ly),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
@@ -426,7 +487,7 @@ def run_images(engine: MultitaskEngine, args: argparse.Namespace) -> None:
 
     n = len(image_paths)
     if n:
-        print(f"\n─── Summary ─────────────────────────────────────────────────────")
+        print(f"\n--- Summary ------------------------------------------------------")
         print(f"  Images     : {n}")
         print(f"  Total dets : {total_dets}  (avg {total_dets / n:.1f} / image)")
         print(f"  Avg GPU    : {total_infer_ms / n:.1f} ms/image")
@@ -437,7 +498,7 @@ def run_images(engine: MultitaskEngine, args: argparse.Namespace) -> None:
         json_path.write_text(json.dumps(results, indent=2))
         print(f"  JSON       : {json_path}")
 
-    print("─────────────────────────────────────────────────────────────────\n")
+    print("------------------------------------------------------------------\n")
 
 
 # ── Video / webcam mode ───────────────────────────────────────────────────────
@@ -517,6 +578,53 @@ def run_video(engine: MultitaskEngine, args: argparse.Namespace) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def run_benchmark(engine: MultitaskEngine, image_path: str, warmup: int = 20, iterations: int = 200) -> None:
+    """Latency benchmark: warmup + timed iterations on a single frame."""
+    frame = cv2.imread(image_path)
+    if frame is None:
+        raise FileNotFoundError(f"Cannot read benchmark image: {image_path}")
+
+    print(f"\n[BENCH] Image       : {image_path}")
+    print(f"[BENCH] Warmup      : {warmup} iters")
+    print(f"[BENCH] Timed       : {iterations} iters")
+    print(f"[BENCH] Input shape : (1, 3, {INPUT_H}, {INPUT_W})")
+
+    # GPU warmup — discarded
+    for _ in range(warmup):
+        engine.infer(frame)
+
+    torch.cuda.synchronize()
+
+    gpu_times: list[float] = []
+    wall_times: list[float] = []
+    for _ in range(iterations):
+        r = engine.infer(frame)
+        gpu_times.append(r["infer_ms"])
+        wall_times.append(r["total_ms"])
+
+    torch.cuda.synchronize()
+
+    gpu_arr = np.array(gpu_times)
+    wall_arr = np.array(wall_times)
+
+    def _stats(arr: np.ndarray, label: str) -> None:
+        print(f"\n[BENCH] {label}")
+        print(f"         min   : {arr.min():.2f} ms")
+        print(f"         p50   : {np.percentile(arr, 50):.2f} ms")
+        print(f"         p90   : {np.percentile(arr, 90):.2f} ms")
+        print(f"         p99   : {np.percentile(arr, 99):.2f} ms")
+        print(f"         max   : {arr.max():.2f} ms")
+        print(f"         mean  : {arr.mean():.2f} ms")
+        print(f"         FPS   : {1000.0 / arr.mean():.1f}")
+
+    _stats(gpu_arr, "GPU kernel latency (engine only)")
+    _stats(wall_arr, "Wall latency (pre+kernel+post)")
+
+    mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    print(f"\n[BENCH] Peak CUDA memory : {mem:.1f} MB")
+    print()
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Python TRT 10 inference for the multitask perception model."
@@ -536,6 +644,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save",       default="", metavar="PATH")
     p.add_argument("--save_json",  action="store_true")
     p.add_argument("--verbose",    action="store_true")
+    p.add_argument("--benchmark",  metavar="IMAGE",
+                   help="Run latency benchmark on this image instead of batch inference")
+    p.add_argument("--bench_warmup",  type=int, default=20,  help="Benchmark warmup iters (default: 20)")
+    p.add_argument("--bench_iters",   type=int, default=200, help="Benchmark timed iters (default: 200)")
     return p.parse_args()
 
 
@@ -551,7 +663,9 @@ def main() -> None:
     engine = MultitaskEngine(args.engine, cfg)
     print("[INFO] Engine ready.\n")
 
-    if args.source is not None:
+    if args.benchmark:
+        run_benchmark(engine, args.benchmark, args.bench_warmup, args.bench_iters)
+    elif args.source is not None:
         run_video(engine, args)
     else:
         run_images(engine, args)

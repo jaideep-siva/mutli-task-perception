@@ -108,13 +108,15 @@ def build_engine(
         raise RuntimeError("Engine build failed — check TRT logs above")
 
     engine_path.parent.mkdir(parents=True, exist_ok=True)
+    engine_bytes = bytes(serialized)
     with open(engine_path, "wb") as f:
-        f.write(serialized)
+        f.write(engine_bytes)
 
     # Persist the timing cache so the next rebuild is fast.
     updated_cache = timing_cache.serialize()
-    timing_cache_path.write_bytes(updated_cache)
-    print(f"[INFO] Timing cache  : saved {len(updated_cache) // 1024} KB to {timing_cache_path}")
+    cache_bytes = bytes(updated_cache)
+    timing_cache_path.write_bytes(cache_bytes)
+    print(f"[INFO] Timing cache  : saved {len(cache_bytes) // 1024} KB to {timing_cache_path}")
 
     size_mb = engine_path.stat().st_size / (1024 ** 2)
     print(f"[INFO] Engine saved  : {engine_path}  ({size_mb:.1f} MB)")
